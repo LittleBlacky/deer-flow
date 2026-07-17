@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SKILL_LOADER_TOOL_NAME = "read_file"
+
 
 _previous_shutdown_isolated_subagent_loop = globals().get("_shutdown_isolated_subagent_loop")
 if callable(_previous_shutdown_isolated_subagent_loop):
@@ -366,6 +368,8 @@ def _filter_tools(
     all_tools: list[BaseTool],
     allowed: list[str] | None,
     disallowed: list[str] | None,
+    *,
+    allowlist_exempt: set[str] | frozenset[str] = frozenset(),
 ) -> list[BaseTool]:
     """Filter tools based on subagent configuration.
 
@@ -373,6 +377,8 @@ def _filter_tools(
         all_tools: List of all available tools.
         allowed: Optional allowlist of tool names. If provided, only these tools are included.
         disallowed: Optional denylist of tool names. These tools are always excluded.
+        allowlist_exempt: Infrastructure tool names that bypass ``allowed`` but
+            remain subject to ``disallowed``.
 
     Returns:
         Filtered list of tools.
@@ -381,7 +387,7 @@ def _filter_tools(
 
     # Apply allowlist if specified
     if allowed is not None:
-        allowed_set = set(allowed)
+        allowed_set = set(allowed) | set(allowlist_exempt)
         filtered = [t for t in filtered if t.name in allowed_set]
 
     # Apply denylist
@@ -471,8 +477,9 @@ class SubagentExecutor:
         self.authz_attributes = normalize_authz_attributes(authz_attributes)
         self.deerflow_trace_id = deerflow_trace_id
 
+        self._available_tools = tools
         self._base_tools = _filter_tools(
-            tools,
+            self._available_tools,
             config.tools,
             config.disallowed_tools,
         )
@@ -588,9 +595,21 @@ class SubagentExecutor:
             return [s for s in all_skills if s.name in allowed]
         return all_skills
 
+    def _base_tools_for_skills(self, skills: list[Skill]) -> list[BaseTool]:
+        """Retain the progressive skill loader unless it was explicitly denied."""
+        if not skills:
+            return self._base_tools
+
+        return _filter_tools(
+            self._available_tools,
+            self.config.tools,
+            self.config.disallowed_tools,
+            allowlist_exempt={_SKILL_LOADER_TOOL_NAME},
+        )
+
     def _apply_skill_allowed_tools(self, skills: list[Skill]) -> list[BaseTool]:
         return filter_tools_by_skill_allowed_tools(
-            self._base_tools,
+            self._base_tools_for_skills(skills),
             skills,
             always_allowed_tool_names=ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES,
         )
@@ -634,7 +653,7 @@ class SubagentExecutor:
 You have access to skills that provide optimized workflows for specific tasks. Each skill contains best practices, frameworks, and references to additional resources.
 
 **Progressive Loading Pattern:**
-1. When a task matches a skill's use case, immediately call `read_file` on the skill's main file using the path provided in the skill tag below
+1. When a task matches a skill's use case, immediately call `{_SKILL_LOADER_TOOL_NAME}` on the skill's main file using the path provided in the skill tag below
 2. Read and understand the skill's workflow and instructions
 3. The skill file contains references to external resources under the same folder
 4. Load referenced resources only when needed during execution
@@ -647,6 +666,24 @@ You have access to skills that provide optimized workflows for specific tasks. E
 </available_skills>
 
 </skill_system>"""
+
+    async def _build_eager_skill_section(self, skills: list[Skill]) -> str:
+        """Build escaped eager skill instructions when read_file is unavailable."""
+        skill_items: list[str] = []
+        for skill in skills:
+            try:
+                content = await asyncio.to_thread(skill.skill_file.read_text, encoding="utf-8")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load instructions for skill {skill.name!r} from {skill.skill_file} because {_SKILL_LOADER_TOOL_NAME} is unavailable") from exc
+
+            content = content.strip()
+            if not content:
+                continue
+            name = html.escape(skill.name, quote=True)
+            body = html.escape(content, quote=False)
+            skill_items.append(f'<skill name="{name}">\n{body}\n</skill>')
+
+        return "\n".join(skill_items)
 
     async def _build_initial_state(self, task: str) -> tuple[dict[str, Any], list[BaseTool], "DeferredToolSetup"]:
         """Build the initial state for agent execution.
@@ -677,7 +714,11 @@ You have access to skills that provide optimized workflows for specific tasks. E
         # surface a tool the policy denied. This matches the lead agent.
         enabled = (self.app_config or get_app_config()).tool_search.enabled
         final_tools, deferred_setup = assemble_deferred_tools(filtered_tools, enabled=enabled)
-        skill_section = self._build_skill_section(skills)
+        if skills and not any(tool.name == _SKILL_LOADER_TOOL_NAME for tool in final_tools):
+            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} {_SKILL_LOADER_TOOL_NAME} unavailable; eagerly loading skill instructions")
+            skill_section = await self._build_eager_skill_section(skills)
+        else:
+            skill_section = self._build_skill_section(skills)
 
         # Combine system_prompt and skills into a single SystemMessage.
         # Some LLM APIs reject multiple SystemMessages with
