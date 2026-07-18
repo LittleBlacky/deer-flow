@@ -368,8 +368,6 @@ def _filter_tools(
     all_tools: list[BaseTool],
     allowed: list[str] | None,
     disallowed: list[str] | None,
-    *,
-    allowlist_exempt: set[str] | frozenset[str] = frozenset(),
 ) -> list[BaseTool]:
     """Filter tools based on subagent configuration.
 
@@ -377,8 +375,6 @@ def _filter_tools(
         all_tools: List of all available tools.
         allowed: Optional allowlist of tool names. If provided, only these tools are included.
         disallowed: Optional denylist of tool names. These tools are always excluded.
-        allowlist_exempt: Infrastructure tool names that bypass ``allowed`` but
-            remain subject to ``disallowed``.
 
     Returns:
         Filtered list of tools.
@@ -387,7 +383,7 @@ def _filter_tools(
 
     # Apply allowlist if specified
     if allowed is not None:
-        allowed_set = set(allowed) | set(allowlist_exempt)
+        allowed_set = set(allowed)
         filtered = [t for t in filtered if t.name in allowed_set]
 
     # Apply denylist
@@ -477,9 +473,8 @@ class SubagentExecutor:
         self.authz_attributes = normalize_authz_attributes(authz_attributes)
         self.deerflow_trace_id = deerflow_trace_id
 
-        self._available_tools = tools
         self._base_tools = _filter_tools(
-            self._available_tools,
+            tools,
             config.tools,
             config.disallowed_tools,
         )
@@ -595,21 +590,9 @@ class SubagentExecutor:
             return [s for s in all_skills if s.name in allowed]
         return all_skills
 
-    def _base_tools_for_skills(self, skills: list[Skill]) -> list[BaseTool]:
-        """Retain the progressive skill loader unless it was explicitly denied."""
-        if not skills:
-            return self._base_tools
-
-        return _filter_tools(
-            self._available_tools,
-            self.config.tools,
-            self.config.disallowed_tools,
-            allowlist_exempt={_SKILL_LOADER_TOOL_NAME},
-        )
-
     def _apply_skill_allowed_tools(self, skills: list[Skill]) -> list[BaseTool]:
         return filter_tools_by_skill_allowed_tools(
-            self._base_tools_for_skills(skills),
+            self._base_tools,
             skills,
             always_allowed_tool_names=ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES,
         )
